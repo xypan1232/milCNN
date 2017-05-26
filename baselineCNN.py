@@ -389,9 +389,13 @@ def run_milcnn():
     fw = open('result_micnn', 'w')
     print(len(os.listdir(data_dir)))
     print(os.listdir(data_dir))
+    finished_protein = set()
     for protein in os.listdir(data_dir):
         
         protein = protein.split('.')[0]
+        if protein in finished_protein:
+            continue
+        finished_protein.add(protein)
         print protein
         fw.write(protein + '\t')
         train_bags, train_labels, test_bags, test_labels = get_all_embedding(protein)
