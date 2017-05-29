@@ -8,7 +8,7 @@ from keras.layers.core import Dense, Dropout, Activation, Flatten
 from keras.layers.normalization import BatchNormalization
 from keras.layers.advanced_activations import PReLU, LeakyReLU
 from keras.optimizers import SGD, RMSprop, Adadelta, Adagrad, Adam
-from keras.layers import normalization, Lambda, GlobalMaxPooling2D
+from keras.layers import normalization, Lambda, GlobalMaxPooling2D, Lambda, GlobalMaxPooling1D
 from keras.layers import LSTM, Bidirectional, Reshape
 from keras.layers.embeddings import Embedding
 from keras.layers.convolutional import Conv2D, MaxPooling2D,Conv1D, MaxPooling1D
@@ -22,7 +22,7 @@ from keras import objectives
 from keras import backend as K
 from keras.utils import np_utils, plot_model
 from sklearn.metrics import roc_curve, auc, roc_auc_score
-_EPSILON = K.epsilon()
+from utils import doublet_shuffle, split_training_validation
 import random
 import gzip
 import pickle
@@ -179,7 +179,7 @@ def get_RNA_concolutional_array(seq, motif_len = 4):
         #data[key] = new_array
     return new_array
 
-def load_graphprot_data(protein, train = True, path = '../milVec/GraphProt_CLIP_sequences/'):
+def load_graphprot_data(protein, train = True, path = '../GraphProt_CLIP_sequences/'):
     data = dict()
     tmp = []
     listfiles = os.listdir(path)
@@ -225,10 +225,64 @@ def loaddata_graphprot(protein, train = True, ushuffle = True):
     
     return np.array(rna_array), label
 
-def get_bag_data(data):
+def read_fasta_file(fasta_file):
+    seq_dict = {}    
+    fp = open(fasta_file, 'r')
+    name = ''
+    for line in fp:
+        #let's discard the newline at the end (if any)
+        line = line.rstrip()
+        #distinguish header from sequence
+        if line[0]=='>': #or line.startswith('>')
+            #it is the header
+            name = line[1:] #discarding the initial >
+            seq_dict[name] = ''
+        else:
+            #it is sequence
+            seq_dict[name] = seq_dict[name] + line.upper()
+    fp.close()
+    
+    return seq_dict
+
+def load_rnacomend_data(datadir = '../data/'):
+    pair_file = datadir + 'interactions_HT.txt'
+    #rbp_seq_file = datadir + 'rbps_HT.fa'
+    rna_seq_file = datadir + 'utrs.fa'
+     
+    rna_seq_dict = read_fasta_file(rna_seq_file)
+
+    inter_pair = {}
+    with open(pair_file, 'r') as fp:
+        for line in fp:
+            values = line.rstrip().split()
+            protein = values[0]
+            rna = values[1]
+            inter_pair.setdefault(protein, []).append(rna)
+    
+    return inter_pair, rna_seq_dict
+
+def get_rnarecommend(rnas, rna_seq_dict):
+    data = {}
+    label = []
+    rna_seqs = []
+    for rna in rnas:
+        rna_seq = rna_seq_dict[rna]
+        rna_seq = rna_seq.replace('T', 'U')
+        label.append(1)
+        rna_seqs.append(rna_seq)
+        label.append(0)
+        shuff_seq = doublet_shuffle(rna_seq)
+        rna_seqs.append(shuff_seq)
+    data["seq"] = rna_seqs
+    data["Y"] = np.array(label)
+    
+    return data
+        
+
+def get_bag_data(seqs, labels):
     bags = []
-    seqs = data["seq"]
-    labels = data["Y"]
+    #seqs = data["seq"]
+    #labels = data["Y"]
     longlen = 0
     for seq in seqs:
         #pdb.set_trace()
@@ -284,11 +338,12 @@ def set_cnn_model(ninstance=4, input_dim = 4, input_length = 107):
                             kernel_size=(1,10),
                             padding="valid",
                             #activation="relu",
-                            strides=1))
+                            strides=(1,3))) # 4 33 16
     model.add(Activation('relu'))
-    model.add(MaxPooling2D(pool_size=(1,3))) # 32 16
+    # model.add(Conv2D(filters=nbfilter*4, kernel_size=(1,5), padding='valid', activation='relu', strides=(1,2))) # 4 94 64
+    # model.add(MaxPooling2D(pool_size=(1,3))) # 4 31 64
     # model.add(Dropout(0.25)) # will be better
-    model.add(Conv2D(filters=nbfilter*2, kernel_size=(1,32), padding='valid', activation='relu', strides=1))
+    model.add(Conv2D(filters=nbfilter*2*4*2*2*2, kernel_size=(1,3), padding='valid', activation='relu', strides=(1,1))) # 4 31 128
     # model.add(Flatten())
     #model.add(Softmax4D(axis=1))
 
@@ -297,30 +352,55 @@ def set_cnn_model(ninstance=4, input_dim = 4, input_length = 107):
     #model.add(Recalc(axis=1))
     # model.add(Flatten())
     # model.add(Dense(nbfilter*2, activation='relu'))
-    model.add(Dropout(0.25))
-    model.add(Conv2D(filters=1, kernel_size=(1,1), padding='valid', activation='sigmoid', strides=1))
+    # model.add(Dropout(0.25))
+    model.add(Conv2D(filters=2, kernel_size=(1,31), padding='valid', activation='softmax', strides=(1,1)))
+    model.add(Lambda(lambda x: x[:,:,:,1], output_shape=(1, 1, 1)))
+
     return model
         
-def get_all_embedding(protein):
-    
+def get_all_mildata(protein, dataset = 'graphprot'):
     data = load_graphprot_data(protein)
+    #seqs = data["seq"]
+    #labels = data["Y"]
     #pdb.set_trace()
-    train_bags, label = get_bag_data(data)
+    train_bags, label = get_bag_data(data["seq"], data["Y"])
     #pdb.set_trace()
+
     test_data = load_graphprot_data(protein, train = False)
-    test_bags, true_y = get_bag_data(test_data) 
+    test_bags, true_y = get_bag_data(test_data["seq"], test_data["Y"]) 
+    
+    return train_bags, label, test_bags, true_y
+
+def get_all_rna_mildata(rnas, seq_dict):
+    data = get_rnarecommend(rnas, seq_dict)
+    labels = data["Y"]
+    seqs = data["seq"]
+    training_val_indice, train_val_label, test_indice, test_label = split_training_validation(labels)
+    
+    train_seqs = []
+    for val in training_val_indice:
+        train_seqs.append(seqs[val])
+        
+    train_bags, label = get_bag_data(train_seqs, train_val_label)
+    
+    test_seqs = []
+    for val in test_indice:
+        test_seqs.append(seqs[val])        
+
+    #test_data = load_graphprot_data(test_seqs, test_label)
+    test_bags, true_y = get_bag_data(test_seqs, test_label) 
     
     return train_bags, label, test_bags, true_y
 
 def run_network(model, total_hid, train_bags, test_bags, y_bags):
     # model.add(Dense(1)) # binary classification
     # model.add(Activation('softmax')) # #instance * 2
-    model.add(GlobalMaxPooling2D()) # max pooling multi instance 
+    model.add(GlobalMaxPooling1D()) # max pooling multi instance 
 
     model.summary()
     savemodelpng = 'net.png'
     #plot_model(model, to_file=savemodelpng, show_shapes=True)
-    print(len(train_bags), len(test_bags), len(y_bags), train_bags[0].shape, y_bags[0].shape, len(train_bags[0]))
+    # print(len(train_bags), len(test_bags), len(y_bags), train_bags[0].shape, y_bags[0].shape, len(train_bags[0]))
     #categorical_crossentropy, binary_crossentropy, mil_squared_error
     #sgd = SGD(lr=0.01, decay=1e-6, momentum=0.9, nesterov=True) 
     #model.compile(loss=mil_squared_error, optimizer='rmsprop') 
@@ -328,18 +408,17 @@ def run_network(model, total_hid, train_bags, test_bags, y_bags):
     #nb_epos= 5
     #model.fit(train_bags, y_bags, batch_size = 60, epochs=nb_epos, verbose = 0)
     
-
     #categorical_crossentropy, binary_crossentropy
     #sgd = SGD(lr=0.01, decay=1e-6, momentum=0.9, nesterov=True) custom_objective
-    model.compile(loss='categorical_crossentropy', optimizer='rmsprop')
+    model.compile(loss='binary_crossentropy', optimizer='rmsprop')
     #model.compile(loss=custom_objective, optimizer='rmsprop')
     print 'model training'
-    nb_epos= 5
-    y_bags = to_categorical(y_bags, 2)
-    for iterate in range(nb_epos):
-        print 'train epoch', iterate
-        for training, y in zip(train_bags, y_bags):
-            tmp_size = len(training)
+    nb_epos= 8
+    # y_bags = to_categorical(y_bags, 2)
+    # for iterate in range(nb_epos):
+    print 'train epoch', nb_epos
+        # for training, y in zip(train_bags, y_bags):
+        #     tmp_size = len(training)
             #pdb.set_trace()
             #ys = np.array(tmp_size *[y]) # make the labels in the bag all have the same labels, maybe not correct?
             # ys = np.zeros((tmp_size,2))
@@ -347,20 +426,22 @@ def run_network(model, total_hid, train_bags, test_bags, y_bags):
             # ys = y*np.ones((4,))   #  I do not understand the correspondence of ys and tarining, need to confirm  ####
             # trainingreshap = np.reshape(training, (1, training.shape[0], training.shape[1], training.shape[2]))
             # print(training.shape, y.shape)
-            model.fit(training, y*np.ones((1,1)), batch_size = tmp_size, epochs=1, verbose = 1)
+    model.fit(train_bags, y_bags, batch_size = 100, epochs=nb_epos, verbose = 1)
         #model.reset_states()
             #ys = np_utils.to_categorical(ys)
             #model.train_on_batch(training, ys)
     print 'predicting'         
-    predictions = []
-    for testing in test_bags:
-	pdb.set_trace()
-        pred = model.predict_proba(testing, verbose = 0)
-        predictions.append(pred[0][0])
-    return predictions
+ #    predictions = []
+ #    for testing in test_bags:
+	# pdb.set_trace()
+    pred = model.predict_proba(test_bags, verbose = 0)
+        # predictions.append(pred[0][0])
+    return pred
 
-def run_milcnn():
-    data_dir = '../milVec/GraphProt_CLIP_sequences/'
+def run_graphprot_milcnn():
+
+    data_dir = '../GraphProt_CLIP_sequences/'
+
     fw = open('result_micnn_mil', 'w')
     print(len(os.listdir(data_dir)))
     print(os.listdir(data_dir))
@@ -368,29 +449,68 @@ def run_milcnn():
     for protein in os.listdir(data_dir):
         
         protein = protein.split('.')[0]
-	if protein in finished_protein:
+
+        if protein in finished_protein:
             continue
         finished_protein.add(protein)
         print protein
         fw.write(protein + '\t')
-        train_bags, train_labels, test_bags, test_labels = get_all_embedding(protein)
-        print(train_bags[0].shape, train_labels[0])
+        train_bags, train_labels, test_bags, test_labels = get_all_mildata(protein)
+        train_bags_arr = np.asarray(train_bags).squeeze()
+        train_labels_arr = np.array(train_labels)
+        test_bags_arr = np.array(test_bags).squeeze()
+        test_labels_arr = np.array(test_labels)
+        print(train_bags[0].shape, train_labels[0], train_bags_arr.shape, train_labels_arr.shape, test_bags_arr.shape, test_labels_arr.shape)
         net =  set_cnn_model(ninstance=train_bags[0].shape[1])
         
         #seq_auc, seq_predict = calculate_auc(seq_net)
         hid = 16
-        predict = run_network(net, hid, train_bags, test_bags, train_labels)
+        predict = run_network(net, hid, train_bags_arr, test_bags_arr, train_labels_arr)
         
-        auc = roc_auc_score(test_labels, predict)
+        auc = roc_auc_score(test_labels_arr, predict)
         print 'AUC:', auc
         fw.write(str(auc) + '\n')
         mylabel = "\t".join(map(str, test_labels))
         myprob = "\t".join(map(str, predict))  
         fw.write(mylabel + '\n')
         fw.write(myprob + '\n')
+    
     fw.close()
+
+def run_rnacomend_milcnn():
+    inter_pair_dict, rna_seq_dict = load_rnacomend_data()
+    fw = open('result_rna_micnn_mil', 'w')
+    
+    for protein, rnas in inter_pair_dict.iteritems():
+        if len(rnas) < 2000:
+            continue
+        print protein
+        fw.write(protein + '\t')
+        train_bags, train_labels, test_bags, test_labels = get_all_rna_mildata(rnas, rna_seq_dict)
+        train_bags_arr = np.asarray(train_bags).squeeze()
+        train_labels_arr = np.array(train_labels)
+        test_bags_arr = np.array(test_bags).squeeze()
+        test_labels_arr = np.array(test_labels)
+        print(train_bags[0].shape, train_labels[0], train_bags_arr.shape, train_labels_arr.shape, test_bags_arr.shape, test_labels_arr.shape)
+        net =  set_cnn_model(ninstance=train_bags[0].shape[1])
+        
+        #seq_auc, seq_predict = calculate_auc(seq_net)
+        hid = 16
+        predict = run_network(net, hid, train_bags_arr, test_bags_arr, train_labels_arr)
+        
+        auc = roc_auc_score(test_labels_arr, predict)
+        print 'AUC:', auc
+        fw.write(str(auc) + '\n')
+        mylabel = "\t".join(map(str, test_labels))
+        myprob = "\t".join(map(str, predict))  
+        fw.write(mylabel + '\n')
+        fw.write(myprob + '\n')
+    
+    fw.close()    
+    
         #run_mil_classifier(train_bags, train_labels, test_bags, test_labels)
-run_milcnn()
+#run_graphprot_milcnn()
+run_rnacomend_milcnn()
 #seq= 'TTATCTCCTAGAAGGGGAGGTTACCTCTTCAAATGAGGAGGCCCCCCAGTCCTGTTCCTCCACCAGCCCCACTACGGAATGGGAGCGCATTTTAGGGTGGTTACTCTGAAACAAGGAGGGCCTAGGAATCTAAGAGTGTGAAGAGTAGAGAGGAAGTACCTCTACCCACCAGCCCACCCGTGCGGGGGAAGATGTAGCAGCTTCTTCTCCGAACCAA'
 #print len(seq)
 #split_overlap_seq(seq)
